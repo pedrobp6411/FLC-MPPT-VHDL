@@ -1,0 +1,178 @@
+-- Fuzzy MPPT Controller - VHDL Implementation with Manual Fixed-Point Scaling (Signed-based)
+library IEEE;
+use IEEE.STD_LOGIC_1164.ALL;
+use IEEE.NUMERIC_STD.ALL;
+
+entity fuzzy_mppt_controller is
+    Port (
+        clk         : in  std_logic;
+        reset       : in  std_logic;
+        enable      : in  std_logic;
+        current_in  : in  signed(15 downto 0);  -- Q1.15 scaled input
+        voltage_in  : in  signed(15 downto 0);  -- Q12.4 scaled input
+        duty_out    : out std_logic_vector(7 downto 0);
+        store_valid : out std_logic;
+        error_out       : out integer;
+        delta_e_out     : out integer;
+        delta_duty_out  : out integer
+    );
+end fuzzy_mppt_controller;
+
+architecture Behavioral of fuzzy_mppt_controller is
+
+    signal power_int      : integer := 0;  -- scaled power
+    signal prev_power_int : integer := 0;
+    signal prev_voltage   : integer := 0;
+    signal error          : integer range -100 to 100 := 0;
+    signal delta_e        : integer range -100 to 100 := 0;
+signal prev_error     : integer := 0;
+    signal delta_duty     : integer := 0;
+    signal duty           : integer range 0 to 100 := 50;
+
+    constant DEADZONE : integer := 2;
+    constant GAIN_KS  : integer := 10;
+
+    type int_array is array (0 to 6) of integer;
+    signal mu_e, mu_de : int_array := (others => 0);
+
+    type rule_table is array (0 to 6, 0 to 6) of integer;
+    constant rules : rule_table := (
+        ( -100, -80, -60, -40, -20, -10,   0),
+        ( -80,  -60, -40, -20, -10,   0,  10),
+        ( -60,  -40, -20, -10,   0,  10,  20),
+        ( -40,  -20, -10,   0,  10,  20,  40),
+        ( -20,  -10,   0,  10,  20,  40,  60),
+        ( -10,    0,  10,  20,  40,  60,  80),
+        (   0,   10,  20,  40,  60,  80, 100)
+    );
+
+    function triangle(x, a, b, c : integer) return integer is
+    begin
+        if x <= a or x >= c then return 0;
+        elsif x = b then return 100;
+        elsif x < b then return ((x - a) * 100) / (b - a);
+        else return ((c - x) * 100) / (c - b);
+        end if;
+    end;
+
+    function trapezoidal_shoulder_neg(x, plateau_end, slope_start, slope_end: integer) return integer is
+    begin
+        if x <= plateau_end then return 100;
+        elsif x >= slope_end then return 0;
+        elsif x > slope_start then return ((slope_end - x) * 100) / (slope_end - slope_start);
+        else return 100;
+        end if;
+    end;
+
+    function trapezoidal_shoulder_pos(x, slope_start, slope_end, plateau_start: integer) return integer is
+    begin
+        if x >= plateau_start then return 100;
+        elsif x <= slope_start then return 0;
+        elsif x < slope_end then return ((x - slope_start) * 100) / (slope_end - slope_start);
+        else return 100;
+        end if;
+    end;
+
+    function min(a, b: integer) return integer is
+    begin
+        if a < b then
+            return a;
+        else
+            return b;
+        end if;
+    end;
+
+begin
+    process(clk, reset)
+        variable numerator, denominator : integer;
+        variable min_mu, rule_val : integer;
+        variable delta_p, delta_v : integer;
+        variable error_raw : integer;
+    begin
+        if reset = '1' then
+            duty <= 50;
+            duty_out <= std_logic_vector(to_unsigned(50, 8));
+            store_valid <= '0';
+
+        elsif rising_edge(clk) then
+            if enable = '1' then
+                power_int <= (to_integer(current_in) * to_integer(voltage_in)) / 65536;
+                delta_p := power_int - prev_power_int;
+                delta_v := to_integer(voltage_in) - prev_voltage;
+
+                if delta_v /= 0 then
+                    error_raw := (delta_p / delta_v) * 100;
+                    if error_raw > 100 then
+                        error <= 100;
+                    elsif error_raw < -100 then
+                        error <= -100;
+                    else
+                        error <= error_raw;
+                    end if;
+                else
+                    error <= 0;
+                end if;
+
+                delta_e <= error - prev_error;
+
+                if abs(error) < DEADZONE and abs(delta_e) < DEADZONE then
+                    delta_duty <= 0;
+                else
+                    mu_e <= (
+                        trapezoidal_shoulder_neg(error, -100, -90, -60),
+                        triangle(error, -90, -60, -30),
+                        triangle(error, -60, -30, 0),
+                        triangle(error, -30, 0, 30),
+                        triangle(error, 0, 30, 60),
+                        triangle(error, 30, 60, 90),
+                        trapezoidal_shoulder_pos(error, 60, 90, 100)
+                    );
+
+                    mu_de <= (
+                        trapezoidal_shoulder_neg(delta_e, -100, -90, -60),
+                        triangle(delta_e, -90, -60, -30),
+                        triangle(delta_e, -60, -30, 0),
+                        triangle(delta_e, -30, 0, 30),
+                        triangle(delta_e, 0, 30, 60),
+                        triangle(delta_e, 30, 60, 90),
+                        trapezoidal_shoulder_pos(delta_e, 60, 90, 100)
+                    );
+
+                    numerator := 0;
+                    denominator := 0;
+                    for i in 0 to 6 loop
+                        for j in 0 to 6 loop
+                            min_mu := min(mu_e(i), mu_de(j));
+                            rule_val := rules(i,j);
+                            numerator := numerator + min_mu * rule_val;
+                            denominator := denominator + min_mu;
+                        end loop;
+                    end loop;
+
+                    if denominator /= 0 then
+                        delta_duty <= numerator / denominator;
+                    else
+                        delta_duty <= 0;
+                    end if;
+                end if;
+
+                duty <= duty + (delta_duty * GAIN_KS) / 100;
+                if duty > 100 then duty <= 100;
+                elsif duty < 0 then duty <= 0;
+                end if;
+
+                duty_out <= std_logic_vector(to_unsigned(duty, 8));
+                error_out <= error;
+                delta_e_out <= delta_e;
+                delta_duty_out <= delta_duty;
+                store_valid <= '1';
+
+                prev_power_int <= power_int;
+                prev_voltage <= to_integer(voltage_in);
+                prev_error <= error;
+            else
+                store_valid <= '0';
+            end if;
+        end if;
+    end process;
+end Behavioral;
